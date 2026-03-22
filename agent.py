@@ -153,11 +153,16 @@ class CherryAgent:
         return info
 
     # ===== KAYIT =====
-    def register_device(self):
-        """Sunucuya ilk kayıt."""
-        if 'token' in self.config:
+    def register_device(self, force=False):
+        """Sunucuya ilk kayıt veya yeniden kayıt."""
+        if 'token' in self.config and not force:
             logger.info("Cihaz zaten kayıtlı, mevcut token kullanılıyor.")
             return True
+
+        # Force durumunda eski token'ı sil
+        if force:
+            self.config.pop('token', None)
+            logger.info("Yeniden kayıt yapılıyor (eski token silindi)...")
 
         device_info = self.get_device_info()
         device_uuid = self.get_device_uuid()
@@ -221,6 +226,9 @@ class CherryAgent:
                     # Authenticate
                     await self.authenticate()
 
+                    # Auth timeout check
+                    asyncio.create_task(self.wait_for_auth())
+
                     # Start background tasks
                     tasks = [
                         asyncio.create_task(self.listen()),
@@ -256,6 +264,10 @@ class CherryAgent:
                 await asyncio.sleep(self.reconnect_delay)
                 self.reconnect_delay = min(self.reconnect_delay * 2, RECONNECT_MAX_DELAY)
 
+                # URL'yi güncelle (UUID değişmiş olabilir)
+                device_uuid = self.get_device_uuid()
+                url = f"{ws_protocol}://{SERVER_HOST}:{SERVER_PORT}/ws/device/{device_uuid}/"
+
     async def authenticate(self):
         """Token ile kimlik doğrulama."""
         auth_msg = {
@@ -265,6 +277,16 @@ class CherryAgent:
         }
         await self.ws.send(json.dumps(auth_msg))
         logger.info("Kimlik doğrulama mesajı gönderildi...")
+
+    async def wait_for_auth(self):
+        """Auth sonucunu bekle — 10 sn içinde auth olmazsa yeniden kayıt ol."""
+        await asyncio.sleep(10)
+        if not self.authenticated:
+            logger.warning("⚠️ Auth 10 saniyede tamamlanmadı. Yeniden kayıt yapılıyor...")
+            self.register_device(force=True)
+            # Bağlantıyı kapat, yeni token ile tekrar bağlanacak
+            if self.ws:
+                await self.ws.close()
 
     async def listen(self):
         """Gelen mesajları dinle ve işle."""
@@ -348,6 +370,11 @@ class CherryAgent:
         else:
             logger.error(f"❌ Kimlik doğrulama başarısız: {data.get('message')}")
             self.authenticated = False
+            # Yeniden kayıt ol ve bağlantıyı kapat
+            logger.info("🔄 Yeniden kayıt yapılıyor...")
+            self.register_device(force=True)
+            if self.ws:
+                await self.ws.close()
 
     async def handle_get_location(self, data, command_id=None):
         """GPS konumu al ve gönder."""
@@ -746,16 +773,16 @@ class CherryAgent:
 
     async def periodic_gps(self):
         """Periyodik GPS gönderimi."""
-        while self.running and self.authenticated:
+        while self.running:
             await asyncio.sleep(GPS_INTERVAL)
-            if self.ws and self.ws.open and self.authenticated:
+            if self.ws and not self.ws.closed and self.authenticated:
                 await self.send_location()
 
     async def periodic_sensor(self):
         """Periyodik sensör verisi gönderimi."""
-        while self.running and self.authenticated:
+        while self.running:
             await asyncio.sleep(SENSOR_INTERVAL)
-            if self.ws and self.ws.open and self.authenticated:
+            if self.ws and not self.ws.closed and self.authenticated:
                 await self.send_sensor_data()
 
     # ===== ANA DÖNGÜ =====
